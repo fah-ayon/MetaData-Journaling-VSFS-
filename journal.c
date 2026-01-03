@@ -1,24 +1,31 @@
+#define _XOPEN_SOURCE 500
+#include <errno.h>
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
-#include <stdint.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
 
-// --- 1. Constants & Structures (Must match mkfs.c and Slides) ---
-#define BLOCK_SIZE 4096
-#define INODE_SIZE 128
-#define FS_MAGIC 0x56534653
-#define JOURNAL_MAGIC 0x4A524E4C // "JRNL" in ASCII
+#define FS_MAGIC 0x56534653U
+#define BLOCK_SIZE        4096U
+#define INODE_SIZE         128U
+#define JOURNAL_BLOCK_IDX    1U
+#define JOURNAL_BLOCKS      16U
+#define INODE_BLOCKS         2U
+#define DATA_BLOCKS         64U
+#define INODE_BMAP_IDX     (JOURNAL_BLOCK_IDX + JOURNAL_BLOCKS)
+#define DATA_BMAP_IDX      (INODE_BMAP_IDX + 1U)
+#define INODE_START_IDX    (DATA_BMAP_IDX + 1U)
+#define DATA_START_IDX     (INODE_START_IDX + INODE_BLOCKS)
+#define TOTAL_BLOCKS       (DATA_START_IDX + DATA_BLOCKS)
 #define DEFAULT_IMAGE "vsfs.img"
 
-// Record Types
-#define REC_DATA 1
-#define REC_COMMIT 2
+#define JOURNAL_MAGIC 0x4A524E4CU
+#define REC_DATA      1
+#define REC_COMMIT    2
 
-// Superblock
 struct superblock {
     uint32_t magic;
     uint32_t block_size;
@@ -32,266 +39,377 @@ struct superblock {
     uint8_t  _pad[128 - 9 * 4];
 };
 
-// Inode
 struct inode {
-    uint16_t type;      // 0=free, 1=file, 2=dir
+    uint16_t type;
     uint16_t links;
     uint32_t size;
     uint32_t direct[8];
     uint32_t ctime;
     uint32_t mtime;
-    uint8_t  _pad[128 - (2+2+4+8*4+4+4)];
+    uint8_t _pad[128 - (2 + 2 + 4 + 8 * 4 + 4 + 4)];
 };
 
-// Directory Entry
-#define NAME_LEN 28
 struct dirent {
-    uint32_t inode;     // 0 = unused
-    char name[NAME_LEN];
+    uint32_t inode;
+    char name[28];
 };
 
-// Journal Header
 struct journal_header {
-    uint32_t magic;       
-    uint32_t nbytes_used; 
+    uint32_t magic;
+    uint32_t nbytes_used;
 };
 
-// Record Header
 struct rec_header {
-    uint32_t type; 
-    uint32_t size; 
+    uint16_t type;
+    uint16_t size;
 };
 
-// --- Globals ---
-uint8_t *disk_image;
-struct superblock *sb;
+struct data_record {
+    struct rec_header hdr;
+    uint32_t block_no;
+    uint8_t data[BLOCK_SIZE];
+};
 
-// --- Helper Functions ---
+struct commit_record {
+    struct rec_header hdr;
+};
 
-// Get a pointer to a specific block index
-void *get_block(uint32_t block_idx) {
-    return disk_image + (block_idx * BLOCK_SIZE);
+_Static_assert(sizeof(struct superblock) == 128, "superblock must be 128 bytes");
+_Static_assert(sizeof(struct inode) == 128, "inode must be 128 bytes");
+_Static_assert(sizeof(struct dirent) == 32, "dirent must be 32 bytes");
+_Static_assert(sizeof(struct journal_header) == 8, "journal_header must be 8 bytes");
+_Static_assert(sizeof(struct rec_header) == 4, "rec_header must be 4 bytes");
+
+static void die(const char *msg) {
+    perror(msg);
+    exit(EXIT_FAILURE);
 }
 
-// Check if a specific bit is set (1) or clear (0)
-int check_bit(void *bitmap_block, int idx) {
-    uint8_t *bmap = (uint8_t *)bitmap_block;
-    return (bmap[idx / 8] >> (idx % 8)) & 1;
+static void pread_block(int fd, uint32_t block_index, void *buf) {
+    off_t offset = (off_t)block_index * BLOCK_SIZE;
+    ssize_t n = pread(fd, buf, BLOCK_SIZE, offset);
+    if (n != (ssize_t)BLOCK_SIZE) {
+        die("pread");
+    }
 }
 
-// Set a specific bit to 1
-void set_bit(void *bitmap_block, int idx) {
-    uint8_t *bmap = (uint8_t *)bitmap_block;
-    bmap[idx / 8] |= (1 << (idx % 8));
+static void pwrite_block(int fd, uint32_t block_index, const void *buf) {
+    off_t offset = (off_t)block_index * BLOCK_SIZE;
+    ssize_t n = pwrite(fd, buf, BLOCK_SIZE, offset);
+    if (n != (ssize_t)BLOCK_SIZE) {
+        die("pwrite");
+    }
 }
 
-// --- Command: Create ---
-void cmd_create(const char *filename) {
-    // 1. Load Metadata pointers
-    void *inode_bmap = get_block(sb->inode_bitmap);
-    struct inode *inode_table = (struct inode *)get_block(sb->inode_start);
-    
-    // Get Root Directory (Inode 0)
-    struct inode *root_inode = &inode_table[0]; 
-    uint32_t root_data_blk_idx = root_inode->direct[0];
-    void *root_dir_block = get_block(root_data_blk_idx);
+static int bitmap_test(const uint8_t *bitmap, uint32_t index) {
+    return (bitmap[index / 8] >> (index % 8)) & 0x1;
+}
 
-    // 2. Find Free Inode (Scan Inode Bitmap)
-    int free_inode_idx = -1;
-    for (int i = 1; i < sb->inode_count; i++) { // Start at 1 (0 is root)
-        if (check_bit(inode_bmap, i) == 0) {
-            free_inode_idx = i;
-            break;
+static void bitmap_set(uint8_t *bitmap, uint32_t index) {
+    bitmap[index / 8] |= (uint8_t)(1U << (index % 8));
+}
+
+static int find_free_bit(const uint8_t *bitmap, uint32_t max_bits) {
+    for (uint32_t i = 0; i < max_bits; ++i) {
+        if (!bitmap_test(bitmap, i)) {
+            return (int)i;
         }
     }
-    if (free_inode_idx == -1) { printf("Error: No free inodes\n"); exit(1); }
-
-// 3. Find Free Directory Entry (Scan Root Directory Block)
-    struct dirent *entries = (struct dirent *)root_dir_block;
-    int free_dirent_idx = -1;
-    int max_entries = BLOCK_SIZE / sizeof(struct dirent);
-    
-    for (int i = 0; i < max_entries; i++) {
-        // FIX: Check if name is empty. Inode 0 is valid for Root ('.'), so we can't rely solely on inode==0.
-        // Unused slots are memset to 0 by mkfs, so their name[0] will be '\0'.
-        if (entries[i].inode == 0 && entries[i].name[0] == '\0') { 
-            free_dirent_idx = i;
-            break;
-        }
-    }
-    if (free_dirent_idx == -1) { printf("Error: Root directory full\n"); exit(1); }
-
-    // 4. PREPARE TRANSACTIONS (In Memory Only)
-    // We need 3 modified blocks: Inode Bitmap, Inode Table, Directory Data
-    
-    // A. Modify Inode Bitmap
-    uint8_t new_bmap[BLOCK_SIZE];
-    memcpy(new_bmap, inode_bmap, BLOCK_SIZE);
-    set_bit(new_bmap, free_inode_idx);
-
-// B. Modify Inode Table
-    // Calculate which block of the inode table contains our free inode
-    uint32_t inodes_per_block = BLOCK_SIZE / sizeof(struct inode);
-    uint32_t itable_blk_offset = free_inode_idx / inodes_per_block;
-    uint32_t inode_blk_idx = sb->inode_start + itable_blk_offset;
-    
-    uint8_t new_inode_blk[BLOCK_SIZE];
-    memcpy(new_inode_blk, get_block(inode_blk_idx), BLOCK_SIZE);
-    
-    // 1. Update the Target Inode (The new file)
-    struct inode *target_inode = (struct inode *)(new_inode_blk + 
-                                 ((free_inode_idx % inodes_per_block) * sizeof(struct inode)));
-    target_inode->type = 1; // File
-    target_inode->links = 1;
-    target_inode->size = 0;
-
-    // 2. FIX: Update Root Inode Size (Inode 0)
-    // Note: Inode 0 is always at the start of the first inode block.
-    // Since we are allocating Inode 1, we are in that same block.
-    if (inode_blk_idx == sb->inode_start) {
-        struct inode *root_inode_ptr = (struct inode *)new_inode_blk; // Inode 0 is at offset 0
-        
-        // We are using the slot at 'free_dirent_idx'. 
-        // We need to ensure size covers this slot.
-        uint32_t needed_size = (free_dirent_idx + 1) * sizeof(struct dirent);
-        
-        if (root_inode_ptr->size < needed_size) {
-            root_inode_ptr->size = needed_size;
-            // printf("Debug: Updating Root Inode size to %d\n", needed_size);
-        }
-    }
-
-    // C. Modify Directory Block
-    uint8_t new_dir_blk[BLOCK_SIZE];
-    memcpy(new_dir_blk, root_dir_block, BLOCK_SIZE);
-    struct dirent *new_entries = (struct dirent *)new_dir_blk;
-    new_entries[free_dirent_idx].inode = free_inode_idx;
-    strncpy(new_entries[free_dirent_idx].name, filename, NAME_LEN);
-
-    // 5. WRITE TO JOURNAL
-    struct journal_header *jh = (struct journal_header *)get_block(sb->journal_block);
-    void *journal_base = get_block(sb->journal_block);
-    
-    // Initialize journal if empty
-    if (jh->nbytes_used == 0) {
-        jh->magic = JOURNAL_MAGIC;
-        jh->nbytes_used = sizeof(struct journal_header);
-    }
-
-    uint32_t offset = jh->nbytes_used;
-    
-    // Check for space (Header + BlockNum + BlockData) * 3 records + Commit
-    size_t needed = 3 * (sizeof(struct rec_header) + 4 + BLOCK_SIZE) + sizeof(struct rec_header);
-    if (offset + needed > 16 * BLOCK_SIZE) {
-        printf("Error: Journal full. Run ./journal install first.\n");
-        exit(1);
-    }
-
-    // Helper macro to write a data record
-    // Format: [Header] [BlockNum] [4096 Bytes Data]
-    #define WRITE_RECORD(target_blk_idx, data_source) { \
-        struct rec_header rh = { .type = REC_DATA, .size = 4 + BLOCK_SIZE }; \
-        memcpy(journal_base + offset, &rh, sizeof(rh)); offset += sizeof(rh); \
-        memcpy(journal_base + offset, &target_blk_idx, 4); offset += 4; \
-        memcpy(journal_base + offset, data_source, BLOCK_SIZE); offset += BLOCK_SIZE; \
-    }
-
-    WRITE_RECORD(sb->inode_bitmap, new_bmap); // 1. Bitmap
-    WRITE_RECORD(inode_blk_idx, new_inode_blk); // 2. Inode Table
-    WRITE_RECORD(root_data_blk_idx, new_dir_blk); // 3. Directory
-
-    // Write Commit Record [cite: 64]
-    struct rec_header rh_commit = { .type = REC_COMMIT, .size = 0 };
-    memcpy(journal_base + offset, &rh_commit, sizeof(rh_commit)); 
-    offset += sizeof(rh_commit);
-
-    // Update Journal Header
-    jh->nbytes_used = offset;
-    printf("Successfully created transaction for '%s' (Inode %d)\n", filename, free_inode_idx);
+    return -1;
 }
 
-// --- Command: Install ---
-void cmd_install() {
-    struct journal_header *jh = (struct journal_header *)get_block(sb->journal_block);
-    void *journal_base = get_block(sb->journal_block);
-
-    if (jh->magic != JOURNAL_MAGIC) {
-        printf("Error: Invalid journal magic number.\n");
+static void init_journal(int fd) {
+    uint8_t journal_data[JOURNAL_BLOCKS * BLOCK_SIZE];
+    
+    for (uint32_t i = 0; i < JOURNAL_BLOCKS; ++i) {
+        pread_block(fd, JOURNAL_BLOCK_IDX + i, journal_data + (i * BLOCK_SIZE));
+    }
+    
+    struct journal_header *jhdr = (struct journal_header *)journal_data;
+    
+    if (jhdr->magic == JOURNAL_MAGIC) {
         return;
     }
-
-    printf("Replaying journal...\n");
-
-    uint32_t offset = sizeof(struct journal_header);
     
-    // Buffer for current transaction data
-    struct pending_write {
-        uint32_t target_blk;
-        void *data_ptr; // Pointer into the mmapped journal
-    } buffer[16]; 
-    int buf_idx = 0;
+    jhdr->magic = JOURNAL_MAGIC;
+    jhdr->nbytes_used = sizeof(struct journal_header);
+    
+    pwrite_block(fd, JOURNAL_BLOCK_IDX, journal_data);
+}
 
-    while (offset < jh->nbytes_used) {
-        struct rec_header *rh = (struct rec_header *)(journal_base + offset);
-        
-        if (rh->type == REC_DATA) {
-            // Queue this write, but don't perform it until we see a COMMIT [cite: 67]
-            uint32_t *blk_num = (uint32_t *)(journal_base + offset + sizeof(struct rec_header));
-            void *data = (void *)(journal_base + offset + sizeof(struct rec_header) + 4);
-            
-            buffer[buf_idx].target_blk = *blk_num;
-            buffer[buf_idx].data_ptr = data;
-            buf_idx++;
-            
-            offset += sizeof(struct rec_header) + rh->size;
-        
-        } else if (rh->type == REC_COMMIT) {
-            // Valid transaction found. Apply all buffered writes to real disk [cite: 81]
-            for (int i = 0; i < buf_idx; i++) {
-                memcpy(get_block(buffer[i].target_blk), buffer[i].data_ptr, BLOCK_SIZE);
-            }
-            printf("Applied transaction with %d block updates.\n", buf_idx);
-            buf_idx = 0; // Reset buffer for next transaction
-            offset += sizeof(struct rec_header);
-        } else {
-            // Corruption or end
+static uint8_t* read_journal(int fd) {
+    uint8_t *journal_data = malloc(JOURNAL_BLOCKS * BLOCK_SIZE);
+    if (!journal_data) {
+        die("malloc journal");
+    }
+    
+    for (uint32_t i = 0; i < JOURNAL_BLOCKS; ++i) {
+        pread_block(fd, JOURNAL_BLOCK_IDX + i, journal_data + (i * BLOCK_SIZE));
+    }
+    
+    return journal_data;
+}
+
+static void write_journal(int fd, const uint8_t *journal_data) {
+    for (uint32_t i = 0; i < JOURNAL_BLOCKS; ++i) {
+        pwrite_block(fd, JOURNAL_BLOCK_IDX + i, journal_data + (i * BLOCK_SIZE));
+    }
+}
+
+static int append_data_record(uint8_t *journal_data, uint32_t block_no, const uint8_t *block_data) {
+    struct journal_header *jhdr = (struct journal_header *)journal_data;
+    uint32_t nbytes = jhdr->nbytes_used;
+    
+    uint32_t record_size = sizeof(struct rec_header) + sizeof(uint32_t) + BLOCK_SIZE;
+    
+    if (nbytes + record_size > JOURNAL_BLOCKS * BLOCK_SIZE) {
+        fprintf(stderr, "Journal full! Please run './journal install' first.\n");
+        return -1;
+    }
+    
+    struct rec_header rec_hdr;
+    rec_hdr.type = REC_DATA;
+    rec_hdr.size = record_size;
+    
+    memcpy(journal_data + nbytes, &rec_hdr, sizeof(rec_hdr));
+    nbytes += sizeof(rec_hdr);
+    
+    memcpy(journal_data + nbytes, &block_no, sizeof(block_no));
+    nbytes += sizeof(block_no);
+    
+    memcpy(journal_data + nbytes, block_data, BLOCK_SIZE);
+    nbytes += BLOCK_SIZE;
+    
+    jhdr->nbytes_used = nbytes;
+    
+    return 0;
+}
+
+static int append_commit_record(uint8_t *journal_data) {
+    struct journal_header *jhdr = (struct journal_header *)journal_data;
+    uint32_t nbytes = jhdr->nbytes_used;
+    
+    uint32_t record_size = sizeof(struct rec_header);
+    
+    if (nbytes + record_size > JOURNAL_BLOCKS * BLOCK_SIZE) {
+        fprintf(stderr, "Journal full! Please run './journal install' first.\n");
+        return -1;
+    }
+    
+    struct rec_header rec_hdr;
+    rec_hdr.type = REC_COMMIT;
+    rec_hdr.size = record_size;
+    
+    memcpy(journal_data + nbytes, &rec_hdr, sizeof(rec_hdr));
+    nbytes += sizeof(rec_hdr);
+    
+    jhdr->nbytes_used = nbytes;
+    
+    return 0;
+}
+
+static void cmd_create(int fd, const char *filename) {
+    struct superblock sb;
+    pread_block(fd, 0, &sb);
+    
+    init_journal(fd);
+    
+    uint8_t *journal_data = read_journal(fd);
+    
+    uint8_t inode_bitmap[BLOCK_SIZE];
+    uint8_t data_bitmap[BLOCK_SIZE];
+    pread_block(fd, INODE_BMAP_IDX, inode_bitmap);
+    pread_block(fd, DATA_BMAP_IDX, data_bitmap);
+    
+    int free_inode = find_free_bit(inode_bitmap, sb.inode_count);
+    if (free_inode < 0) {
+        fprintf(stderr, "No free inodes available.\n");
+        free(journal_data);
+        return;
+    }
+    
+    uint8_t root_data_block[BLOCK_SIZE];
+    pread_block(fd, DATA_START_IDX, root_data_block);
+    struct dirent *dirents = (struct dirent *)root_data_block;
+    
+    int free_entry = -1;
+    uint32_t max_entries = BLOCK_SIZE / sizeof(struct dirent);
+    for (uint32_t i = 0; i < max_entries; ++i) {
+        if (dirents[i].inode == 0 && dirents[i].name[0] == '\0') {
+            free_entry = (int)i;
             break;
         }
     }
+    
+    if (free_entry < 0) {
+        fprintf(stderr, "Root directory is full.\n");
+        free(journal_data);
+        return;
+    }
+    
+    uint8_t inode_block[BLOCK_SIZE];
+    uint32_t inode_block_idx = free_inode / (BLOCK_SIZE / INODE_SIZE);
+    uint32_t inode_offset = (free_inode % (BLOCK_SIZE / INODE_SIZE)) * INODE_SIZE;
+    pread_block(fd, INODE_START_IDX + inode_block_idx, inode_block);
+    
+    struct inode new_inode_data;
+    memset(&new_inode_data, 0, sizeof(new_inode_data));
+    new_inode_data.type = 1;
+    new_inode_data.links = 1;
+    new_inode_data.size = 0;
+    memset(new_inode_data.direct, 0, sizeof(new_inode_data.direct));
+    time_t now = time(NULL);
+    new_inode_data.ctime = (uint32_t)now;
+    new_inode_data.mtime = (uint32_t)now;
+    
+    memcpy(inode_block + inode_offset, &new_inode_data, sizeof(struct inode));
+    
+    if (inode_block_idx == 0) {
+        struct inode *root_inode = (struct inode *)inode_block;
+        root_inode->size = (free_entry + 1) * sizeof(struct dirent);
+        root_inode->mtime = (uint32_t)now;
+    }
+    
+    bitmap_set(inode_bitmap, free_inode);
+    
+    dirents[free_entry].inode = (uint32_t)free_inode;
+    strncpy(dirents[free_entry].name, filename, sizeof(dirents[free_entry].name) - 1);
+    dirents[free_entry].name[sizeof(dirents[free_entry].name) - 1] = '\0';
+    
+    if (append_data_record(journal_data, INODE_BMAP_IDX, inode_bitmap) < 0) {
+        free(journal_data);
+        return;
+    }
+    
+    if (append_data_record(journal_data, INODE_START_IDX + inode_block_idx, inode_block) < 0) {
+        free(journal_data);
+        return;
+    }
+    
+    if (inode_block_idx != 0) {
+        uint8_t root_inode_block[BLOCK_SIZE];
+        pread_block(fd, INODE_START_IDX, root_inode_block);
+        struct inode *root_inode = (struct inode *)root_inode_block;
+        root_inode->size = (free_entry + 1) * sizeof(struct dirent);
+        root_inode->mtime = (uint32_t)now;
+        
+        if (append_data_record(journal_data, INODE_START_IDX, root_inode_block) < 0) {
+            free(journal_data);
+            return;
+        }
+    }
+    
+    if (append_data_record(journal_data, DATA_START_IDX, root_data_block) < 0) {
+        free(journal_data);
+        return;
+    }
+    
+    if (append_commit_record(journal_data) < 0) {
+        free(journal_data);
+        return;
+    }
+    
+    write_journal(fd, journal_data);
+    free(journal_data);
+}
 
-    // Reset Journal [cite: 83]
-    jh->nbytes_used = sizeof(struct journal_header);
-    printf("Journal installed and cleared.\n");
+static void cmd_install(int fd) {
+    uint8_t *journal_data = read_journal(fd);
+    struct journal_header *jhdr = (struct journal_header *)journal_data;
+    
+    if (jhdr->magic != JOURNAL_MAGIC) {
+        fprintf(stderr, "Journal is not initialized.\n");
+        free(journal_data);
+        return;
+    }
+    
+    if (jhdr->nbytes_used == sizeof(struct journal_header)) {
+        free(journal_data);
+        return;
+    }
+    
+    uint32_t offset = sizeof(struct journal_header);
+    int transaction_count = 0;
+    
+    while (offset < jhdr->nbytes_used) {
+        if (offset + sizeof(struct rec_header) > jhdr->nbytes_used) {
+            fprintf(stderr, "Incomplete record header at offset %u\n", offset);
+            break;
+        }
+        
+        struct rec_header *rec_hdr = (struct rec_header *)(journal_data + offset);
+        
+        if (rec_hdr->type == REC_DATA) {
+            if (offset + sizeof(struct rec_header) + sizeof(uint32_t) + BLOCK_SIZE > jhdr->nbytes_used) {
+                fprintf(stderr, "Incomplete data record at offset %u\n", offset);
+                break;
+            }
+            
+            uint32_t block_no;
+            memcpy(&block_no, journal_data + offset + sizeof(struct rec_header), sizeof(block_no));
+            
+            uint8_t *block_data = journal_data + offset + sizeof(struct rec_header) + sizeof(uint32_t);
+            
+            pwrite_block(fd, block_no, block_data);
+            
+            offset += rec_hdr->size;
+        }
+        else if (rec_hdr->type == REC_COMMIT) {
+            transaction_count++;
+            offset += rec_hdr->size;
+        }
+        else {
+            fprintf(stderr, "Unknown record type %u at offset %u\n", rec_hdr->type, offset);
+            break;
+        }
+    }
+    
+    jhdr->nbytes_used = sizeof(struct journal_header);
+    write_journal(fd, journal_data);
+    free(journal_data);
+    
+    if (transaction_count > 0) {
+        printf("Applied %d transaction(s) from journal.\n", transaction_count);
+        printf("Journal cleared.\n");
+    }
+    
 }
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
-        printf("Usage: %s <create <name> | install>\n", argv[0]);
-        return 1;
+        fprintf(stderr, "Usage: %s <create|install> [filename]\n", argv[0]);
+        fprintf(stderr, "  create <filename>  - Create a file entry (log metadata)\n");
+        fprintf(stderr, "  install            - Apply journaled updates to disk\n");
+        return EXIT_FAILURE;
     }
-
-    int fd = open(DEFAULT_IMAGE, O_RDWR);
-    if (fd < 0) { perror("open"); return 1; }
-
-    struct stat st;
-    fstat(fd, &st);
     
-    // Map the whole disk image into memory for easy access
-    disk_image = mmap(NULL, st.st_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (disk_image == MAP_FAILED) { perror("mmap"); return 1; }
+    const char *command = argv[1];
+    const char *image_path = DEFAULT_IMAGE;
     
-    sb = (struct superblock *)disk_image;
-
-    if (strcmp(argv[1], "create") == 0) {
-        if (argc != 3) { printf("Usage: create <filename>\n"); return 1; }
-        cmd_create(argv[2]);
-    } else if (strcmp(argv[1], "install") == 0) {
-        cmd_install();
-    } else {
-        printf("Unknown command: %s\n", argv[1]);
+    int fd = open(image_path, O_RDWR);
+    if (fd < 0) {
+        die("open");
     }
-
-    munmap(disk_image, st.st_size);
+    
+    if (strcmp(command, "create") == 0) {
+        if (argc < 3) {
+            fprintf(stderr, "Usage: %s create <filename>\n", argv[0]);
+            close(fd);
+            return EXIT_FAILURE;
+        }
+        const char *filename = argv[2];
+        cmd_create(fd, filename);
+    }
+    else if (strcmp(command, "install") == 0) {
+        cmd_install(fd);
+    }
+    else {
+        fprintf(stderr, "Unknown command '%s'\n", command);
+        fprintf(stderr, "Valid commands: create, install\n");
+        close(fd);
+        return EXIT_FAILURE;
+    }
+    
     close(fd);
-    return 0;
+    return EXIT_SUCCESS;
 }
