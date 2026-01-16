@@ -106,6 +106,12 @@ If the filesystem is healthy, it reports: "Filesystem 'vsfs.img' is consistent."
 | Superblock Magic | `0x56534653` |
 | Journal Magic | `0x4A524E4C` |
 
+## Contributors
+
+- [Ahnaf Iqbal](https://github.com/ahnaf-iqbal) - Collaborator
+- [Md. Mahmudur Rahman](https://github.com/MdLabib007) - Collaborator
+
+
 ## License
 
 This project is provided for educational use in systems programming and operating systems courses.
